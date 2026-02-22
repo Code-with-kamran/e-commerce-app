@@ -1,0 +1,210 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+    provider  = "postgresql"
+  
+ 
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// CATEGORY
+// Simple product grouping. A product belongs to one category.
+// Admin creates and manages categories.
+// ─────────────────────────────────────────────────────────────────────
+model Category {
+  id          Int       @id @default(autoincrement())
+  name        String
+  slug        String    @unique    // e.g. "mens-wallets"
+  description String?
+  products    Product[]
+  createdAt   DateTime  @default(now())
+
+  @@index([slug])
+}
+
+
+
+// ─────────────────────────────────────────────────────────────────────
+// PRODUCT
+//
+// ⚠️ PRICE RULE: Always store price in CENTS (integer), never decimals.
+//   $29.99  →  2999
+//   $100.00 →  10000
+//
+// Reason: floating point math is unreliable for money.
+//   0.1 + 0.2 = 0.30000000000000004 in JavaScript.
+//   Integers never have this problem.
+//
+// Convert to display string only at the UI layer using:
+//   (price / 100).toFixed(2)  or  Intl.NumberFormat
+// ─────────────────────────────────────────────────────────────────────
+model Product {
+  id             Int         @id @default(autoincrement())
+  name           String
+  slug           String      @unique    // e.g. "handmade-leather-wallet"
+  description    String      @db.Text   // Allows longer text in Postgres
+  price          Int                    // In cents, e.g. 2999 = $29.99
+  compareAtPrice Int?                   // Original price, shown as strikethrough
+  stockQuantity  Int         @default(0)
+  images         String[]               // Array of R2 image URLs, first = primary
+  categoryId     Int?
+  category       Category?  @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  published      Boolean     @default(false)  // Draft by default
+  orderItems     OrderItem[]
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@index([slug])
+  @@index([categoryId])
+  @@index([published])      // Public listing queries always filter by published: true
+  @@index([published, createdAt])  // Compound: listing page sorted by newest
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// ORDER
+//
+// Created by the Stripe webhook handler AFTER payment is confirmed.
+// Never created by the frontend directly.
+//
+// shippingAddress stored as Json because address shape can vary
+// by country and we don't want 6 nullable columns.
+//
+// All amounts in CENTS — same rule as Product.price.
+// ─────────────────────────────────────────────────────────────────────
+model Order {
+  id          Int         @id @default(autoincrement())
+
+  // Human-readable order number shown to customer and admin
+  // Format: ORD-2026-000042
+  orderNumber String      @unique
+
+  status      OrderStatus @default(PENDING)
+
+  // ── Customer snapshot ──────────────────────────────────────
+  // Guest checkout — no user account.
+  // Stored directly on the order so it survives if we ever add
+  // accounts later without losing guest order history.
+  customerName  String
+  customerEmail String
+  customerPhone String?
+
+  // ── Shipping address ───────────────────────────────────────
+  // Example JSON shape:
+  // {
+  //   "line1":    "123 Main Street",
+  //   "line2":    "Apartment 4B",   (optional)
+  //   "city":     "Lahore",
+  //   "state":    "Punjab",
+  //   "zip":      "54000",
+  //   "country":  "PK"
+  // }
+  shippingAddress Json
+
+  // ── Amounts (all in cents) ─────────────────────────────────
+  subtotal     Int                    // Sum of all line items
+  shippingCost Int         @default(0)
+  total        Int                    // subtotal + shippingCost
+
+  // ── Stripe reference ───────────────────────────────────────
+  // Used in webhook handler to:
+  //   1. Confirm the payment actually happened
+  //   2. Prevent duplicate order creation (idempotency)
+  stripePaymentIntentId String?  @unique
+
+  items     OrderItem[]
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@index([customerEmail])
+  @@index([status])
+  @@index([stripePaymentIntentId])
+  @@index([createdAt])      // Admin orders list sorted by newest first
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// ORDER STATUS ENUM
+//
+// PENDING   → Order row created, Stripe payment not yet confirmed.
+//             (Rare edge case — usually the webhook fires before
+//              the user sees the confirmation page.)
+// PAID      → Stripe webhook confirmed payment. This is the default
+//             "new order" state the admin sees.
+// PROCESSING→ Admin acknowledged, preparing the order.
+// SHIPPED   → Admin marked as dispatched.
+// DELIVERED → Admin confirmed delivery.
+// CANCELLED → Admin or system cancelled the order.
+// ─────────────────────────────────────────────────────────────────────
+enum OrderStatus {
+  PENDING
+  PAID
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// ORDER ITEM
+//
+// ⚠️ CRITICAL DESIGN DECISION: productName and productPrice are
+// SNAPSHOTS taken at the time of purchase.
+//
+// WHY THIS MATTERS:
+//   Scenario: Customer buys a wallet for $29.99.
+//   Six months later, client updates the wallet price to $39.99.
+//   If you only store productId and JOIN to Product at display time,
+//   the order history now shows $39.99 — which is WRONG.
+//
+//   Always snapshot name and price. Always.
+//
+// productId is nullable because:
+//   - Admin may delete a product later.
+//   - The order must still display correctly even after deletion.
+//   - onDelete: SetNull sets productId to null, order item survives.
+// ─────────────────────────────────────────────────────────────────────
+model OrderItem {
+  id      Int    @id @default(autoincrement())
+  orderId Int
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productId Int?
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  // ── Snapshots — always populated, always trustworthy ───────
+  productName  String   // Product name at time of purchase
+  productPrice Int      // Price in cents at time of purchase
+  productImage String?  // First image URL at time of purchase
+
+  quantity Int
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// ADMIN USER
+//
+// Single row for the shop owner. No public registration.
+// Password is bcrypt-hashed (never plain text, never MD5/SHA1).
+// Auth.js credentials provider reads from this table.
+// ─────────────────────────────────────────────────────────────────────
+model AdminUser {
+  id             Int      @id @default(autoincrement())
+  email          String   @unique
+  hashedPassword String
+  createdAt      DateTime @default(now())
+}
